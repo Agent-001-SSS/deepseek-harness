@@ -419,4 +419,48 @@ describe('windows-acl write grants (LocalSandboxProvider)', () => {
       cleanup()
     }
   })
+
+  it('recreates the private temp directory when it vanishes while the provider keeps running', async () => {
+    try {
+      const { sandbox, fiber } = await setup()
+      const ws = workspaceRoot()
+      scratch.push(ws)
+      const policy: SandboxPolicy = {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: brandString<SessionId>('vanished'),
+      }
+
+      const first = await sandbox.confine(['pwsh', '/Command', 'x'], policy)
+      const tempDir = flag(first.argv, '--temp') ?? ''
+      expect(existsSync(tempDir)).toBe(true)
+      const staleGrant = mockState.grants.at(-1)
+
+      // An OS temp cleaner (or a manual sweep) removes the private directory
+      // while the provider keeps running. The runner refuses an argv whose
+      // `--temp` is not an existing directory, so the cached capability must
+      // never be handed out again: it is dropped and a fresh one materialized,
+      // instead of bricking every later confined command of the session.
+      rmSync(tempDir, { recursive: true, force: true })
+      expect(existsSync(tempDir)).toBe(false)
+
+      const second = await sandbox.confine(['pwsh', '/Command', 'x'], policy)
+      const recreated = flag(second.argv, '--temp') ?? ''
+      expect(recreated).not.toBe(tempDir)
+      expect(basename(recreated)).toMatch(/^dsh-[A-Za-z0-9_-]{6}$/u)
+      expect(existsSync(recreated)).toBe(true)
+      expect(flag(second.argv, '--temp-write-sid')).toBe(`TEMP:${recreated}`)
+
+      // The stale capability was disposed (its ACE left with the directory) and
+      // one fresh temp capability replaced it; the standing workspace grant is
+      // untouched, and later calls keep reusing the recreated directory.
+      expect(staleGrant?.disposed).toBe(true)
+      expect(mockState.grants.filter(grant => grant.writeSid.startsWith('TEMP:'))).toHaveLength(2)
+      expect(mockState.grants.filter(grant => grant.writeSid === WORKSPACE_SID)).toHaveLength(1)
+
+      const third = await sandbox.confine(['pwsh', '/Command', 'x'], policy)
+      expect(flag(third.argv, '--temp')).toBe(recreated)
+      await fiber.dispose()
+    } finally {
+      cleanup()
+    }
+  })
 })
