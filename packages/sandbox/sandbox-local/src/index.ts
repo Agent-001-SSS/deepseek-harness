@@ -22,7 +22,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -204,6 +204,24 @@ const STATIC_ENFORCEMENT: Record<SelectedRunner['runner'], SandboxEnforcement> =
   // child: the backend enforces the remaining ACL-addressable surface but
   // must not advertise the absolute promise.
   'windows-acl': 'partial',
+}
+
+/**
+ * Whether `path` is still a directory.
+ *
+ * The windows-acl runner's own contract (`requireDirectory`) is exactly this
+ * check, and the capability cache must agree with it: a cached path that is no
+ * longer a directory is a dead path the runner refuses on every call, which
+ * bricks every later confined command of that session until the host restarts.
+ * @param path - the cached private temp directory.
+ * @returns true while the directory is still there.
+ */
+function isLiveDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -463,7 +481,21 @@ export class LocalSandboxProvider extends SandboxProvider {
     }
     const key = JSON.stringify([String(sessionId), workspaceRoot])
     const existing = this.tempCapabilities.get(key)
-    if (existing !== undefined) return existing
+    if (existing !== undefined && isLiveDirectory(existing.dir)) return existing
+    if (existing !== undefined) {
+      // The private temp directory disappeared while this provider kept
+      // running (an OS temp cleaner, an antivirus purge, a manual sweep): the
+      // runner requires `--temp` to exist, so returning the cached capability
+      // would fail every later confined command for this session. Drop the
+      // stale entry — its write ACE lived on the directory and left with it —
+      // and materialize a fresh random directory below.
+      this.tempCapabilities.delete(key)
+      try {
+        existing.grant.dispose()
+      } catch {
+        // Nothing left to revoke: the ACE was stored on the missing directory.
+      }
+    }
     let tempDir: string
     try {
       tempDir = mkdtempSync(join(tmpdir(), 'dsh-'))
